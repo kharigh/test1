@@ -24,19 +24,26 @@ if PREPROCESS_THRESHOLD:
 reader = easyocr.Reader(['en'], gpu=False)
 results = reader.readtext("image.png")
 
-# 3️⃣ Merge boxes into rows by Y
+# 3️⃣ Fix OCR mistakes and keep only boxes with digits
 boxes = []
 for bbox, text, conf in results:
-    # Remove common OCR misreads if any
+    # correct common OCR misreads
     text = text.replace('O','0').replace('o','0').replace('l','1').replace('I','1')
-    x = bbox[0][0]
-    y = bbox[0][1]
-    boxes.append((x, y, text))
+    # Only keep boxes containing digits
+    if re.search(r'\d', text):
+        x = bbox[0][0]
+        y = bbox[0][1]
+        boxes.append((x, y, text))
 
-# Sort by Y
+if not boxes:
+    print("No numeric boxes detected!")
+    exit()
+
+# 4️⃣ Sort boxes by Y coordinate
 boxes.sort(key=lambda b: b[1])
 
-merged_lines = []
+# 5️⃣ Merge boxes into rows by Y proximity
+merged_rows = []
 current_row = []
 row_y = None
 
@@ -47,11 +54,9 @@ for x, y, text in boxes:
     elif abs(y - row_y) <= Y_THRESHOLD:
         current_row.append((x, text))
     else:
-        # Sort current row by X
+        # Sort by X
         current_row.sort(key=lambda r: r[0])
-        # Merge text
-        merged_text = "".join([t for _, t in current_row])
-        merged_lines.append(merged_text)
+        merged_rows.append(" ".join([t for _, t in current_row]))
         # Start new row
         current_row = [(x, text)]
         row_y = y
@@ -59,31 +64,20 @@ for x, y, text in boxes:
 # last row
 if current_row:
     current_row.sort(key=lambda r: r[0])
-    merged_text = "".join([t for _, t in current_row])
-    merged_lines.append(merged_text)
+    merged_rows.append(" ".join([t for _, t in current_row]))
 
-# 4️⃣ Filter merged lines: only digits, comma, brackets, spaces
-numeric_lines = []
-for line in merged_lines:
-    if re.fullmatch(r'[\d\[\]\s,]+', line):
-        numeric_lines.append(line)
-
-# 5️⃣ Extract exactly NUM_COLUMNS numbers per row
+# 6️⃣ Extract numbers from each merged row
 rows = []
-for line in numeric_lines:
-    # Remove brackets and spaces
-    line_clean = line.replace('[','').replace(']','').replace(' ','')
-    # Split by comma
-    nums = re.findall(r'\d+', line_clean)  # only positive integers
+for line in merged_rows:
+    nums = re.findall(r'\d+', line)  # only positive integers
     if len(nums) == NUM_COLUMNS:
         rows.append(nums)
 
-# 6️⃣ Convert to NumPy array
+# 7️⃣ Convert to NumPy array
 if rows:
     matrix = np.array(rows, dtype=int)
     print("Matrix shape:", matrix.shape)
     print(matrix)
-    # Save CSV
     np.savetxt("extracted_matrix.csv", matrix, delimiter=",", fmt="%d")
 else:
-    print("No valid numeric array rows found!")
+    print("No valid 22-number rows found!")
