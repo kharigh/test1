@@ -1,4 +1,4 @@
-import easyocr
+from paddleocr import PaddleOCR
 import re
 import numpy as np
 import csv
@@ -6,105 +6,80 @@ import csv
 # -----------------------------
 IMAGE_PATH = "image.png"
 CSV_PATH = "extracted_matrix.csv"
-MIN_X_GAP = 5   # horizontal gap to merge partial numbers
+MODEL_DIR = "./paddle_models"  # local model directory
+Y_THRESHOLD_FACTOR = 0.6       # how tight to group rows
 # -----------------------------
 
-# 1️⃣ Initialize EasyOCR
-reader = easyocr.Reader(['en'], gpu=False)
-results = reader.readtext(IMAGE_PATH)
+# 1️⃣ Initialize PaddleOCR using local model dirs
+ocr = PaddleOCR(
+    det_model_dir=f"{MODEL_DIR}/PP-OCRv5_server_det",
+    rec_model_dir=f"{MODEL_DIR}/PP-OCRv5_server_rec",
+    cls_model_dir=f"{MODEL_DIR}/PP-OCRv5_server_cls",
+    use_angle_cls=True,
+    lang="en"
+)
 
-# 2️⃣ Extract bounding box centroids and numbers
+# 2️⃣ Run OCR
+result = ocr.ocr(IMAGE_PATH, cls=True)
+
+# 3️⃣ Collect number boxes with centroid
 boxes = []
 heights = []
-for bbox, text, conf in results:
+for line in result:
+    # Each `line` has format: [bbox, (text, conf)]
+    bbox, (text, score) = line
     # Fix common OCR misreads
-    text = text.replace('O','0').replace('o','0').replace('l','1').replace('I','1')
-    if re.search(r'\d', text):  # keep only boxes with numbers
-        y_min = min(pt[1] for pt in bbox)
-        y_max = max(pt[1] for pt in bbox)
-        centroid_y = (y_min + y_max) / 2
-        x_min = min(pt[0] for pt in bbox)
-        box_height = y_max - y_min
+    text = text.replace('O', '0').replace('o', '0')
+    text = text.replace('l', '1').replace('I', '1')
+
+    # Only keep if contains digit
+    if re.search(r"\d", text):
+        # get box centroid Y
+        coords = np.array(bbox)
+        y_centroid = (coords[:,1].min() + coords[:,1].max()) / 2
+        x_min = coords[:,0].min()
+        box_height = coords[:,1].max() - coords[:,1].min()
         heights.append(box_height)
-        boxes.append((x_min, centroid_y, text))
+
+        # extract one or more numbers
+        nums = re.findall(r'\d+', text)
+        for n in nums:
+            boxes.append((x_min, y_centroid, int(n)))
 
 if not boxes:
     print("No numbers detected!")
     exit()
 
-# 3️⃣ Compute adaptive Y threshold
-median_height = np.median(heights)
-Y_THRESHOLD = max(5, median_height * 0.8)  # adaptive row height
+# 4️⃣ Adaptive row grouping
+median_h = np.median(heights) if heights else 10
+y_thresh = max(5, median_h * Y_THRESHOLD_FACTOR)
 
-# 4️⃣ Sort by centroid Y then X
 boxes.sort(key=lambda b: (b[1], b[0]))
 
-# 5️⃣ Initial grouping by centroid Y
 rows = []
-current_row = []
+current = []
 row_y = None
 
-for x, y, text in boxes:
+for x, y, n in boxes:
     if row_y is None:
         row_y = y
-        current_row.append((x, text))
-    elif abs(y - row_y) <= Y_THRESHOLD:
-        current_row.append((x, text))
+        current.append((x, n))
+    elif abs(y - row_y) <= y_thresh:
+        current.append((x, n))
     else:
-        rows.append(current_row)
-        current_row = [(x, text)]
+        current.sort(key=lambda r: r[0])
+        rows.append([num for _, num in current])
+        current = [(x, n)]
         row_y = y
-if current_row:
-    rows.append(current_row)
 
-# 6️⃣ Soft merge adjacent rows if they are too close vertically
-merged_rows = []
-i = 0
-while i < len(rows):
-    row = rows[i]
-    y_values = [b[1] for b in row]
-    row_centroid = np.mean(y_values)
-    # merge next row if centroids are close
-    j = i + 1
-    while j < len(rows):
-        next_row = rows[j]
-        next_centroid = np.mean([b[1] for b in next_row])
-        if next_centroid - row_centroid <= Y_THRESHOLD:
-            row += next_row
-            row_centroid = np.mean([b[1] for _, y, _ in row])
-            j += 1
-        else:
-            break
-    merged_rows.append(row)
-    i = j
+if current:
+    current.sort(key=lambda r: r[0])
+    rows.append([num for _, num in current])
 
-# 7️⃣ Merge partial numbers horizontally and sort X
-final_rows = []
-for row in merged_rows:
-    row.sort(key=lambda r: r[0])  # left to right
-    numbers = []
-    buffer = ''
-    last_x = None
-    for x, text in row:
-        if last_x is not None and x - last_x <= MIN_X_GAP:
-            buffer += text  # merge partial number
-        else:
-            if buffer:
-                # extract numbers from previous buffer
-                nums = re.findall(r'\d+', buffer)
-                numbers.extend([int(n) for n in nums])
-            buffer = text
-        last_x = x
-    # flush last buffer
-    if buffer:
-        nums = re.findall(r'\d+', buffer)
-        numbers.extend([int(n) for n in nums])
-    final_rows.append(numbers)
-
-# 8️⃣ Save as CSV (integers)
-with open(CSV_PATH, 'w', newline='') as f:
+# 5️⃣ Save rows to CSV
+with open(CSV_PATH, "w", newline="") as f:
     writer = csv.writer(f)
-    for row in final_rows:
-        writer.writerow(row)
+    for r in rows:
+        writer.writerow(r)
 
-print(f"Saved {len(final_rows)} rows to {CSV_PATH}")
+print(f"Saved {len(rows)} rows to {CSV_PATH}")
